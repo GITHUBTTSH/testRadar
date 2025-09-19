@@ -2,7 +2,6 @@ import serial
 import serial.tools.list_ports
 import threading
 import time
-import collections # 引入deque用于更高效的缓存操作
 
 DATA_BITS_MAP = {"5": serial.FIVEBITS, "6": serial.SIXBITS, "7": serial.SEVENBITS, "8": serial.EIGHTBITS}
 STOP_BITS_MAP = {"1": serial.STOPBITS_ONE, "1.5": serial.STOPBITS_ONE_POINT_FIVE, "2": serial.STOPBITS_TWO}
@@ -20,12 +19,12 @@ class serialManager:
         self.control_callback = None
         self.data_callback = None
 
-        self._control_buffer = collections.deque()
-        self._data_buffer = collections.deque()
+        # 固定大小缓存区
+        self._control_buffer = bytearray(buffer_size)
+        self._control_index = 0
+        self._data_buffer = bytearray(buffer_size)
+        self._data_index = 0
         self._buffer_size = buffer_size
-
-        self.LINE_FEED = b'\n'
-        self.CARRIAGE_RETURN = b'\r'
 
     def connect(self, control_port, control_baud, data_port, data_baud,
                 data_bits="8", stop_bits="1", parity="None"):
@@ -38,7 +37,8 @@ class serialManager:
                 self.control_serial.bytesize = DATA_BITS_MAP[data_bits]
                 self.control_serial.stopbits = STOP_BITS_MAP[stop_bits]
                 self.control_serial.parity = PARITY_MAP[parity]
-                self.control_serial.timeout = 0.1
+                # self.control_serial.rtscts = False,  # 关闭 RTS/CTS
+                # self.control_serial.dsrdtr = False  # 关闭 DSR/DTR
                 self.control_serial.open()
             if data_port:
                 self.data_serial.port = data_port
@@ -46,7 +46,8 @@ class serialManager:
                 self.data_serial.bytesize = DATA_BITS_MAP[data_bits]
                 self.data_serial.stopbits = STOP_BITS_MAP[stop_bits]
                 self.data_serial.parity = PARITY_MAP[parity]
-                self.data_serial.timeout = 0.1
+                # self.data_serial.rtscts = False,  # 关闭 RTS/CTS
+                # self.data_serial.dsrdtr = False  # 关闭 DSR/DTR
                 self.data_serial.open()
 
             self.is_connected = True
@@ -67,7 +68,6 @@ class serialManager:
         if self.data_serial.is_open:
             self.data_serial.close()
         self.is_connected = False
-        print("串口管理器已断开所有连接。")
 
     @staticmethod
     def list_ports():
@@ -75,96 +75,70 @@ class serialManager:
 
     def send_control(self, data: bytes):
         if self.control_serial.is_open:
-            try:
-                self.control_serial.write(data)
-            except serial.SerialException as e:
-                print(f"控制口发送失败: {e}")
+            self.control_serial.write(data)
 
     def send_data(self, data: bytes):
         if self.data_serial.is_open:
-            try:
-                self.data_serial.write(data)
-            except serial.SerialException as e:
-                print(f"数据口发送失败: {e}")
+            self.data_serial.write(data)
 
     def _receive_loop(self):
         while not self._stop_event.is_set():
             try:
-                # 控制口处理
-                if self.control_serial.is_open:
-                    if self.control_serial.in_waiting:
-                        chunk = self.control_serial.read(self.control_serial.in_waiting)
-                        if chunk:
-                            for byte_data in chunk:
-                                if self.control_callback:
-                                    self.control_callback(bytes([byte_data]))
+                # 控制口
+                if self.control_serial.is_open and self.control_serial.in_waiting:
+                    # 逐字节读取
+                    byte_data = self.control_serial.read(1)
+                    if byte_data and self.control_callback:
+                        self.control_callback(byte_data)
 
-                # 数据口处理
-                if self.data_serial.is_open:
-                    if self.data_serial.in_waiting:
-                        chunk = self.data_serial.read(self.data_serial.in_waiting)
-                        if chunk:
-                            self._data_buffer.extend(chunk)
+                # 数据口
+                if self.data_serial.is_open and self.data_serial.in_waiting:
+                    # 逐字节读取
+                    byte_data = self.data_serial.read(1)
+                    if byte_data and self.data_callback:
+                        self.data_callback(byte_data)
 
-                        while self.LINE_FEED in self._data_buffer:
-                            idx = self._data_buffer.index(self.LINE_FEED)
-                            line_bytes = bytes([self._data_buffer.popleft() for _ in range(idx + 1)])
-
-                            if line_bytes.endswith(self.CARRIAGE_RETURN + self.LINE_FEED):
-                                line_bytes = line_bytes[:-2]
-                            elif line_bytes.endswith(self.LINE_FEED):
-                                line_bytes = line_bytes[:-1]
-
-                            if self.data_callback:
-                                self.data_callback(line_bytes)
-
-            except serial.SerialException as e:
-                print(f"串口通信错误，正在断开连接: {e}")
-                self.disconnect()
-                break
             except Exception as e:
-                print(f"接收线程发生未知异常: {e}")
+                print("接收线程异常:", e)
+            time.sleep(0.00001) #避免空转报错
 
-            time.sleep(0.001)
 
 if __name__ == "__main__":
     def control_data_received(data):
-        print(f"控制口接收到: {data.hex()}")
+        print(f"控制口接收到: {data.hex()}") # 打印十六进制
 
-    def data_data_received(data_line: bytes):
-        try:
-            decoded_line = data_line.decode('utf-8', errors='ignore')
-            print(f"数据口接收到: {decoded_line.strip()}")
-        except UnicodeDecodeError:
-            print(f"数据口接收到 (非UTF-8): {data_line.hex()}")
+    def data_data_received(data):
+        print(f"数据口接收到: {data.decode('utf-8', errors='ignore')}") # 尝试解码为UTF-8
 
     manager = serialManager()
     manager.control_callback = control_data_received
     manager.data_callback = data_data_received
 
+    # 打印可用串口
     print("可用串口:")
-    ports = manager.list_ports()
-    if not ports:
-        print("  未找到任何可用串口。")
-    for port, desc in ports:
+    for port, desc in manager.list_ports():
         print(f"  {port}: {desc}")
 
-    control_port = "COM12"
-    data_port = "COM13"
+    # 请根据你的实际串口名称和波特率修改这里
+    control_port = "COM4"  # 替换为你的控制串口
+    data_port = "COM5"     # 替换为你的数据串口
     baud_rate = 115200
 
     if manager.connect(control_port, baud_rate, data_port, baud_rate):
         print(f"成功连接到 {control_port} 和 {data_port}")
-        print("\n等待数据接收... (按下 Ctrl+C 停止)")
 
         try:
-            while manager.is_connected:
-                time.sleep(0.1) # 保持主线程活跃
+            while True:
+                # 示例：每秒发送一个字节
+                # manager.send_control(b'\x01')
+                # manager.send_data(b'A')
+                time.sleep(1)
         except KeyboardInterrupt:
-            print("用户中断 (Ctrl+C)，正在断开连接...")
+            print("用户中断，正在断开连接...")
         finally:
             manager.disconnect()
-            print("程序结束。")
+            print("连接已断开。")
     else:
-        print("连接失败，请检查串口名称、波特率和连接状态。")
-        print("确保串口未被其他程序占用，且端口号正确。")
+        print("连接失败，请检查串口设置。")
+
+
